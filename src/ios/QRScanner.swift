@@ -95,6 +95,21 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
         commandDelegate!.send(pluginResult, callbackId:command.callbackId)
     }
 
+    // MARK: - Internal helpers
+
+    private func resetSessionCompletely() {
+        if let session = self.captureSession {
+            session.stopRunning()
+        }
+        self.cameraView.removePreviewLayer()
+        self.captureVideoPreviewLayer = nil
+        self.metaOutput = nil
+        self.captureSession = nil
+        self.currentCamera = 0
+        self.frontCamera = nil
+        self.backCamera = nil
+    }
+
     // Utility helper
     @objc func backgroundThread(delay: Double = 0.0, background: (() -> Void)? = nil, completion: (() -> Void)? = nil) {
         if #available(iOS 8.0, *) {
@@ -120,50 +135,74 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
             return false
         }
 
+        // FIX #1: stale session cleanup (e.g., after app offload/restore)
+        if let session = captureSession {
+            if session.inputs.isEmpty || session.outputs.isEmpty {
+                resetSessionCompletely()
+            }
+        }
+
         do {
             if (captureSession?.isRunning != true) {
                 cameraView.backgroundColor = .clear
-                self.webView!.superview!.insertSubview(cameraView, belowSubview: self.webView!)
+                if let webView = self.webView, let parent = webView.superview {
+                    parent.insertSubview(cameraView, belowSubview: webView)
+                }
 
-                let session = AVCaptureDevice.DiscoverySession(
-                    deviceTypes: [.builtInWideAngleCamera],
+                let discovery = AVCaptureDevice.DiscoverySession(
+                    deviceTypes: [.builtInWideAngleCamera], // add more types if you want
                     mediaType: .video,
                     position: .unspecified
                 )
-                let cameras = session.devices.compactMap { $0 }
+                let cameras = discovery.devices
+
+                // Populate front/back references
                 for camera in cameras {
                     if camera.position == .front {
                         self.frontCamera = camera
-                    }
-                    if camera.position == .back {
+                    } else if camera.position == .back {
                         self.backCamera = camera
-                        try? camera.lockForConfiguration()
-                        camera.focusMode = .continuousAutoFocus
-                        camera.unlockForConfiguration()
+                        do {
+                            try camera.lockForConfiguration()
+                            if camera.isFocusModeSupported(.continuousAutoFocus) {
+                                camera.focusMode = .continuousAutoFocus
+                            }
+                            camera.unlockForConfiguration()
+                        } catch {
+                            // non-fatal: keep going
+                        }
                     }
                 }
 
-                // FIX: If no camera at all, return clean error instead of showing white screen
+                // FIX #2: no-device guard (avoid white overlay)
                 if backCamera == nil && frontCamera == nil {
                     self.sendErrorCode(command: command, error: .camera_unavailable)
                     return false
                 }
 
                 // If no back camera, default to front
-                if backCamera == nil {
-                    currentCamera = 1
-                }
+                if backCamera == nil { currentCamera = 1 }
 
                 let input = try self.createCaptureDeviceInput()
-                captureSession = AVCaptureSession()
-                captureSession!.addInput(input)
-                metaOutput = AVCaptureMetadataOutput()
-                captureSession!.addOutput(metaOutput!)
-                metaOutput!.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
-                metaOutput!.metadataObjectTypes = [.qr]
-                captureVideoPreviewLayer = AVCaptureVideoPreviewLayer(session: captureSession!)
+
+                let session = AVCaptureSession()
+                // (Optionally tune the preset here if needed)
+                session.beginConfiguration()
+                if session.canAddInput(input) { session.addInput(input) }
+
+                let output = AVCaptureMetadataOutput()
+                if session.canAddOutput(output) { session.addOutput(output) }
+                output.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
+                if output.availableMetadataObjectTypes.contains(.qr) {
+                    output.metadataObjectTypes = [.qr]
+                }
+
+                session.commitConfiguration()
+
+                captureSession = session
+                captureVideoPreviewLayer = AVCaptureVideoPreviewLayer(session: session)
                 cameraView.addPreviewLayer(captureVideoPreviewLayer)
-                captureSession!.startRunning()
+                session.startRunning()
             }
             return true
         } catch CaptureError.backCameraUnavailable {
@@ -223,15 +262,16 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
         }
     }
 
-    // Metadata delegate
+    // MARK: - AVCaptureMetadataOutputObjectsDelegate
+
     func metadataOutput(_ captureOutput: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
         if metadataObjects.count == 0 || scanning == false {
             return
         }
         let found = metadataObjects[0] as! AVMetadataMachineReadableCodeObject
-        if found.type == .qr && found.stringValue != nil {
+        if found.type == .qr, let value = found.stringValue {
             scanning = false
-            let pluginResult = CDVPluginResult(status: CDVCommandStatus_OK, messageAs: found.stringValue)
+            let pluginResult = CDVPluginResult(status: CDVCommandStatus_OK, messageAs: value)
             commandDelegate!.send(pluginResult, callbackId: nextScanningCommand?.callbackId!)
             nextScanningCommand = nil
         }
@@ -247,7 +287,7 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
     @objc func prepare(_ command: CDVInvokedUrlCommand){
         let status = AVCaptureDevice.authorizationStatus(for: .video)
         if status == .notDetermined {
-            AVCaptureDevice.requestAccess(for: .video, completionHandler: { (granted) -> Void in
+            AVCaptureDevice.requestAccess(for: .video, completionHandler: { (_: Bool) -> Void in
                 self.backgroundThread(delay: 0, completion: {
                     if(self.prepScanner(command: command)){
                         self.getStatus(command)
@@ -308,6 +348,7 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
         self.getStatus(command)
     }
 
+    // backCamera is 0, frontCamera is 1
     @objc func useCamera(_ command: CDVInvokedUrlCommand){
         let index = command.arguments[0] as! Int
         if(currentCamera != index){
@@ -316,10 +357,13 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
                 if(self.prepScanner(command: command)){
                     do {
                         captureSession!.beginConfiguration()
-                        let currentInput = captureSession?.inputs[0] as! AVCaptureDeviceInput
-                        captureSession!.removeInput(currentInput)
+                        if let currentInput = captureSession?.inputs.first as? AVCaptureDeviceInput {
+                            captureSession!.removeInput(currentInput)
+                        }
                         let input = try self.createCaptureDeviceInput()
-                        captureSession!.addInput(input)
+                        if captureSession!.canAddInput(input) {
+                            captureSession!.addInput(input)
+                        }
                         captureSession!.commitConfiguration()
                         self.getStatus(command)
                     } catch {
@@ -352,16 +396,9 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
 
     @objc func destroy(_ command: CDVInvokedUrlCommand) {
         self.makeOpaque()
-        if(self.captureSession != nil){
+        if self.captureSession != nil {
             backgroundThread(delay: 0, background: {
-                self.captureSession!.stopRunning()
-                self.cameraView.removePreviewLayer()
-                self.captureVideoPreviewLayer = nil
-                self.metaOutput = nil
-                self.captureSession = nil
-                self.currentCamera = 0
-                self.frontCamera = nil
-                self.backCamera = nil
+                self.resetSessionCompletely()
             }, completion: {
                 self.getStatus(command)
             })
